@@ -31,10 +31,11 @@ Initialize-Environment
     Write-Host "4. Bulk REMOVE Members from Distribution Group (CSV)" -ForegroundColor Red
     Write-Host "5. Search and Delete Mail by SUBJECT (Phishing Cleanup)" -ForegroundColor Magenta
     Write-Host "6. Search and Delete Mail by SENDER (Phishing Cleanup)" -ForegroundColor Magenta
+    Write-Host "7. Search and Delete Mail by SENDER, SUBJECT and DATE (Advanced & Optional)" -ForegroundColor Magenta
     Write-Host "Q. Quit / Exit" -ForegroundColor Red
     Write-Host "----------------------------------------------------------"
     
-    $choice = Read-Host "Please select an option (1-6 or Q)"
+    $choice = Read-Host "Please select an option (1-7 or Q)"
 
     switch($choice) {
         1 {
@@ -184,14 +185,98 @@ Initialize-Environment
             Pause
         }
 
+        7 {
+            Write-Host "`n[ GUIDE: DELETE BY SENDER, SUBJECT AND DATE (OPTIONAL) ]" -ForegroundColor Magenta
+            $csvPath = Read-Host "Enter Path to CSV list"
+            
+            if (!(Test-Path $csvPath)) { Write-Host "CSV not found!" -ForegroundColor Red; Pause; continue }
+
+            # Input variables are optional. Press Enter to skip any criteria.
+            $senderAddr = Read-Host "Enter Sender Address (Leave blank to skip)"
+            $subjectInput = Read-Host "Enter Subject to search (Leave blank to skip)"
+            
+            Write-Host "`n[Date Format: YYYY-MM-DD (Example: 2026-06-01). Leave blank to skip]" -ForegroundColor Yellow
+            $startDate = Read-Host "Enter Start Date (YYYY-MM-DD)"
+            $endDate = Read-Host "Enter End Date (YYYY-MM-DD)"
+            
+            # ===================================================================================
+            # DYNAMIC QUERY CONSTRUCTION:
+            # The script evaluates each entered filter and appends non-empty criteria to the $queryParts array.
+            # If both dates are provided, it builds a range query. If only one is provided, it uses >= or <= operators.
+            # Finally, the array elements are joined using the ' AND ' operator for valid KQL formatting.
+            # ===================================================================================
+            $queryParts = @()
+            
+            if (![string]::IsNullOrEmpty($senderAddr)) { $queryParts += "From:""$senderAddr""" }
+            if (![string]::IsNullOrEmpty($subjectInput)) { $queryParts += "Subject:""$subjectInput""" }
+            
+            if (![string]::IsNullOrEmpty($startDate) -and ![string]::IsNullOrEmpty($endDate)) {
+                $queryParts += "Received:$startDate..$endDate"
+            } elseif (![string]::IsNullOrEmpty($startDate)) {
+                $queryParts += "Received:>=$startDate"
+            } elseif (![string]::IsNullOrEmpty($endDate)) {
+                $queryParts += "Received:<=$endDate"
+            }
+
+            # Safety Gate: If the user left all filters blank, abort to prevent accidental full mailbox deletion
+            if ($queryParts.Count -eq 0) {
+                Write-Host "ERROR: You must enter at least one filter (Sender, Subject, or Date)!" -ForegroundColor Red
+                Pause
+                continue
+            }
+
+            # Join parts into a single KQL query string
+            $advancedQuery = $queryParts -join " AND "
+            Write-Host "`n[DEBUG] Active Query: $advancedQuery" -ForegroundColor Gray
+            
+            $adminMailbox = Read-Host "Enter Admin Mailbox for logs"
+            $logFolder = "PhishingAdvancedLogs"
+            $exportPath = "C:\Temp\Deletion_Advanced_Report_$(Get-Date -Format 'ddMMyy_HHmm').csv"
+
+            $list = Import-Csv $csvPath
+            $foundList = @()
+            $reportData = @()
+
+            Write-Host "Step 1: Scanning mailboxes with active filters..." -ForegroundColor Cyan
+            foreach ($row in $list) {
+                $email = $row.Email
+                try {
+                    $check = Search-Mailbox -Identity $email -SearchQuery $advancedQuery -LogOnly -LogLevel Basic -TargetMailbox $adminMailbox -TargetFolder $logFolder -ErrorAction Stop
+                    if ($check.ResultItemsCount -gt 0) {
+                        Write-Host "MATCH FOUND: $email ($($check.ResultItemsCount) items)" -ForegroundColor Yellow
+                        $foundList += [PSCustomObject]@{ Mailbox = $email; ItemsFound = $check.ResultItemsCount }
+                    }
+                } catch { Write-Host "ERROR scanning $email" -ForegroundColor Red }
+            }
+
+            if ($foundList.Count -gt 0) {
+                Write-Host "`nFound $($foundList.Count) mailboxes. Type 'OK' to proceed with deletion." -ForegroundColor White
+                $confirm = Read-Host "Confirmation"
+                if ($confirm -eq "OK" -or $confirm -eq "ok") {
+                    foreach ($item in $foundList) {
+                        $user = $item.Mailbox
+                        try {
+                            Search-Mailbox -Identity $user -SearchQuery $advancedQuery -DeleteContent -Force -ErrorAction Stop | Out-Null
+                            Write-Host "$user : Deleted." -ForegroundColor Gray
+                            $reportData += [PSCustomObject]@{ Mailbox = $user; ItemsDeleted = $item.ItemsFound; Status = "Deleted"; DateExecuted = Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
+                        } catch {
+                            $reportData += [PSCustomObject]@{ Mailbox = $user; ItemsDeleted = 0; Status = "Failed"; DateExecuted = Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
+                        }
+                    }
+                    $reportData | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
+                    Write-Host "SUCCESS! Report saved to: $exportPath" -ForegroundColor Green
+                } else { Write-Host "Aborted." -ForegroundColor DarkYellow }
+            } else { Write-Host "No matches found." -ForegroundColor White }
+            Pause
+        }
+
         "q" { 
             Write-Host "`nExiting Administrative Toolkit. Goodbye!" -ForegroundColor Cyan
-            # This now breaks the loop labeled MainMenu
             break MainMenu 
         }
 
         default {
-            Write-Host "Invalid selection. Please choose 1-6 or Q." -ForegroundColor Red
+            Write-Host "Invalid selection. Please choose 1-7 or Q." -ForegroundColor Red
             Pause
         }
     }
